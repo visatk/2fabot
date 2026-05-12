@@ -1,0 +1,40 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "my",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-04-12",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"observability": {
+		"enabled": true
+	},
+    "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "shop-bot",
+      "database_id": "3f72b578-a57d-4262-88f1-58e5bc1b4ba4"
+    }
+  ],
+   "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "bb8ef261cab04944973a633c28673def"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "BROADCAST_QUEUE",
+        "queue": "shop-bot-broadcast"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "shop-bot-broadcast",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5
+      }
+    ]
+  }
+}
