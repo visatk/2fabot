@@ -207,7 +207,7 @@ async function handleStart(db: D1Database, token: string, chatId: number, from: 
 	const name = esc(from.first_name ?? 'there');
 	const text =
 		`🔐 *Welcome, ${name}\\!*\n\n` +
-		`I'm your **Secure Edge 2FA Authenticator**\\.\n` +
+		`I'm your **Secure 2FA Authenticator**\\.\n` +
 		`Fast, serverless, and completely private\\.\n\n` +
 		`━━━━━━━━━━━━━━━━\n` +
 		`➕ \`/add <Service> <Secret>\`\n` +
@@ -217,7 +217,7 @@ async function handleStart(db: D1Database, token: string, chatId: number, from: 
 		`ℹ️ \`/help\`\n` +
 		`_View detailed instructions_\n` +
 		`━━━━━━━━━━━━━━━━\n\n` +
-		`🛡️ _Your keys are encrypted entirely on Cloudflare D1\\._`;
+		`🛡️ _Your keys are encrypted\\._`;
 
 	await callTelegram(token, 'sendMessage', {
 		chat_id: chatId,
