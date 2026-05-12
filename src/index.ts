@@ -1,7 +1,6 @@
 import { Hono } from 'hono';
 import * as OTPAuth from 'otpauth';
 
-// 1. Define our Runtime Bindings
 export type Bindings = {
 	DB: D1Database;
 	TELEGRAM_BOT_TOKEN: string;
@@ -9,137 +8,199 @@ export type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>();
 
-// Helper: Securely send messages via Telegram API
-async function sendTelegramMessage(token: string, chatId: number, text: string) {
-	const url = `https://api.telegram.org/bot${token}/sendMessage`;
-	await fetch(url, {
+// --- TELEGRAM API HELPERS ---
+
+async function callTelegramAPI(token: string, method: string, payload: any) {
+	const url = `https://api.telegram.org/bot${token}/${method}`;
+	return fetch(url, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({
-			chat_id: chatId,
-			text: text,
-			parse_mode: 'MarkdownV2',
-		}),
+		body: JSON.stringify(payload),
 	});
 }
 
-// Helper: Escape MarkdownV2 special characters
 function escapeMarkdown(text: string): string {
 	return text.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 }
 
-// 2. Main Webhook Handler
+// --- MIDDLEWARE: USER PROFILE MANAGEMENT ---
+
+async function upsertUserProfile(db: D1Database, from: any) {
+	await db.prepare(`
+		INSERT INTO users (user_id, username, first_name, last_active) 
+		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(user_id) DO UPDATE SET 
+		username = excluded.username, 
+		first_name = excluded.first_name, 
+		last_active = CURRENT_TIMESTAMP
+	`).bind(from.id, from.username || null, from.first_name || null).run();
+}
+
+// --- MAIN WEBHOOK ROUTER ---
+
 app.post('/webhook', async (c) => {
 	const update = await c.req.json();
-
-	// Ignore non-message updates to save compute cycles
-	if (!update.message || !update.message.text) return c.text('OK');
-
-	const chatId = update.message.chat.id;
-	const text = update.message.text.trim();
 	const db = c.env.DB;
 	const token = c.env.TELEGRAM_BOT_TOKEN;
 
-	const args = text.split(' ');
-	const command = args[0].toLowerCase();
-
 	try {
-		// --- COMMAND: /start ---
-		if (command === '/start') {
-			const welcome = `*Welcome to Edge 2FA Bot* 🚀\n\n` +
-				`Commands:\n` +
-				`\`/add <service> <base32_secret>\` \\- Add a new 2FA code\n` +
-				`\`/get <service>\` \\- Get the current TOTP code\n` +
-				`\`/list\` \\- List all your saved services\n` +
-				`\`/delete <service>\` \\- Remove a service`;
-			await sendTelegramMessage(token, chatId, welcome);
-		} 
-		
-		// --- COMMAND: /add ---
-		else if (command === '/add' && args.length >= 3) {
-			const service = args[1];
-			// Clean up secret (remove spaces, standardize case)
-			const secret = args[2].toUpperCase().replace(/\s+/g, '');
+		// 1. HANDLE INLINE BUTTON CLICKS (CALLBACK QUERIES)
+		if (update.callback_query) {
+			const query = update.callback_query;
+			const chatId = query.message.chat.id;
+			const messageId = query.message.message_id;
+			const data = query.data; // e.g., "get:Google", "del:Google"
 			
-			// Validate the Base32 secret before saving
-			try {
-				new OTPAuth.TOTP({ secret: OTPAuth.Secret.fromBase32(secret) });
-			} catch (e) {
-				await sendTelegramMessage(token, chatId, `❌ *Invalid Base32 secret*\\. Please check your key\\.`);
-				return c.text('OK');
+			await upsertUserProfile(db, query.from);
+
+			const [action, ...serviceParts] = data.split(':');
+			const service = serviceParts.join(':');
+
+			if (action === 'get') {
+				const record = await db.prepare('SELECT secret FROM totp_secrets WHERE user_id = ? AND service = ?')
+					.bind(chatId, service).first<{ secret: string }>();
+
+				if (record) {
+					const totp = new OTPAuth.TOTP({
+						issuer: service,
+						label: '2FABot',
+						algorithm: 'SHA1',
+						digits: 6,
+						period: 30,
+						secret: OTPAuth.Secret.fromBase32(record.secret)
+					});
+					
+					const code = totp.generate();
+					const text = `🔐 *${escapeMarkdown(service)}* 2FA Code:\n\n\`${code}\`\n\n_Tap the code to copy\\. Valid for 30s\\._`;
+					
+					// Update the message with the code and a "Back to List" button
+					await callTelegramAPI(token, 'editMessageText', {
+						chat_id: chatId,
+						message_id: messageId,
+						text: text,
+						parse_mode: 'MarkdownV2',
+						reply_markup: {
+							inline_keyboard: [[{ text: '🔙 Back to List', callback_data: 'list_services' }]]
+						}
+					});
+				}
+			} else if (action === 'del') {
+				await db.prepare('DELETE FROM totp_secrets WHERE user_id = ? AND service = ?')
+					.bind(chatId, service).run();
+
+				await callTelegramAPI(token, 'editMessageText', {
+					chat_id: chatId,
+					message_id: messageId,
+					text: `🗑️ Service *${escapeMarkdown(service)}* has been securely deleted\\.`,
+					parse_mode: 'MarkdownV2',
+					reply_markup: {
+						inline_keyboard: [[{ text: '🔙 Back to List', callback_data: 'list_services' }]]
+					}
+				});
+			} else if (action === 'list_services') {
+				// Re-render the list view
+				await renderServiceList(db, token, chatId, messageId);
 			}
 
-			// Upsert into D1 Database
-			await db.prepare('INSERT OR REPLACE INTO totp_secrets (user_id, service, secret) VALUES (?, ?, ?)')
-				.bind(chatId, service, secret)
-				.run();
+			// Acknowledge the callback to remove the loading state on the user's client
+			await callTelegramAPI(token, 'answerCallbackQuery', { callback_query_id: query.id });
+			return c.text('OK');
+		}
+
+		// 2. HANDLE STANDARD TEXT MESSAGES
+		if (update.message && update.message.text) {
+			const chatId = update.message.chat.id;
+			const text = update.message.text.trim();
+			
+			await upsertUserProfile(db, update.message.from);
+
+			const args = text.split(' ');
+			const command = args[0].toLowerCase();
+
+			if (command === '/start') {
+				const profile = await db.prepare('SELECT first_name FROM users WHERE user_id = ?').bind(chatId).first<{ first_name: string }>();
+				const welcome = `*Welcome, ${escapeMarkdown(profile?.first_name || 'User')}!* 🛡️\n\n` +
+					`I am your secure Edge 2FA Authenticator\\.\n\n` +
+					`*To add a service:*\n\`/add <Service> <SecretKey>\`\n\n` +
+					`*To view/manage codes:*\nSend \`/list\` or use the menu\\.`;
 				
-			await sendTelegramMessage(token, chatId, `✅ Service *${escapeMarkdown(service)}* added successfully\\!`);
-		} 
-		
-		// --- COMMAND: /get ---
-		else if (command === '/get' && args.length === 2) {
-			const service = args[1];
-			
-			const record = await db.prepare('SELECT secret FROM totp_secrets WHERE user_id = ? AND service = ?')
-				.bind(chatId, service)
-				.first<{ secret: string }>();
+				await callTelegramAPI(token, 'sendMessage', {
+					chat_id: chatId,
+					text: welcome,
+					parse_mode: 'MarkdownV2'
+				});
+			} 
+			else if (command === '/add' && args.length >= 3) {
+				const service = args[1];
+				const secret = args[2].toUpperCase().replace(/\s+/g, '');
+				
+				try {
+					new OTPAuth.TOTP({ secret: OTPAuth.Secret.fromBase32(secret) });
+				} catch (e) {
+					await callTelegramAPI(token, 'sendMessage', {
+						chat_id: chatId,
+						text: `❌ *Invalid Base32 secret*\\.`,
+						parse_mode: 'MarkdownV2'
+					});
+					return c.text('OK');
+				}
 
-			if (!record) {
-				await sendTelegramMessage(token, chatId, `❌ Service *${escapeMarkdown(service)}* not found\\.`);
-				return c.text('OK');
+				await db.prepare('INSERT OR REPLACE INTO totp_secrets (user_id, service, secret) VALUES (?, ?, ?)')
+					.bind(chatId, service, secret).run();
+					
+				await callTelegramAPI(token, 'sendMessage', {
+					chat_id: chatId,
+					text: `✅ *${escapeMarkdown(service)}* secured\\.\nUse \`/list\` to view it\\.`,
+					parse_mode: 'MarkdownV2'
+				});
+			} 
+			else if (command === '/list' || command === '/manage') {
+				await renderServiceList(db, token, chatId);
 			}
-
-			// Generate TOTP on the Edge
-			const totp = new OTPAuth.TOTP({
-				issuer: service,
-				label: '2FABot',
-				algorithm: 'SHA1',
-				digits: 6,
-				period: 30,
-				secret: OTPAuth.Secret.fromBase32(record.secret)
-			});
-			
-			const code = totp.generate();
-			
-			// Formatted in monospace `code` for one-tap copying in Telegram UI
-			await sendTelegramMessage(token, chatId, `🔐 *${escapeMarkdown(service)}*:\n\n\`${code}\``);
-		} 
-		
-		// --- COMMAND: /list ---
-		else if (command === '/list') {
-			const { results } = await db.prepare('SELECT service FROM totp_secrets WHERE user_id = ?')
-				.bind(chatId)
-				.all<{ service: string }>();
-
-			if (!results || results.length === 0) {
-				await sendTelegramMessage(token, chatId, `You have no saved services\\.`);
-			} else {
-				const services = results.map(r => `\\- \`${escapeMarkdown(r.service)}\``).join('\n');
-				await sendTelegramMessage(token, chatId, `📋 *Your Services:*\n${services}`);
-			}
-		} 
-		
-		// --- COMMAND: /delete ---
-		else if (command === '/delete' && args.length === 2) {
-			const service = args[1];
-			await db.prepare('DELETE FROM totp_secrets WHERE user_id = ? AND service = ?')
-				.bind(chatId, service)
-				.run();
-			await sendTelegramMessage(token, chatId, `🗑️ Service *${escapeMarkdown(service)}* deleted\\.`);
-		} 
-		
-		// --- FALLBACK ---
-		else {
-			await sendTelegramMessage(token, chatId, `Unknown command\\. Use \`/start\` to see instructions\\.`);
 		}
 	} catch (err) {
-		console.error('Edge Execution Error:', err);
-		await sendTelegramMessage(token, chatId, `⚠️ *An internal edge error occurred*\\.`);
+		console.error('Bot Error:', err);
 	}
 
-	// Always return 200 OK so Telegram doesn't retry the webhook delivery
 	return c.text('OK');
 });
+
+// --- UI GENERATOR ---
+
+async function renderServiceList(db: D1Database, token: string, chatId: number, editMessageId?: number) {
+	const { results } = await db.prepare('SELECT service FROM totp_secrets WHERE user_id = ?').bind(chatId).all<{ service: string }>();
+
+	if (!results || results.length === 0) {
+		const text = `📭 You have no 2FA services saved\\.\nUse \`/add <Service> <Secret>\` to add one\\.`;
+		if (editMessageId) {
+			await callTelegramAPI(token, 'editMessageText', { chat_id: chatId, message_id: editMessageId, text, parse_mode: 'MarkdownV2' });
+		} else {
+			await callTelegramAPI(token, 'sendMessage', { chat_id: chatId, text, parse_mode: 'MarkdownV2' });
+		}
+		return;
+	}
+
+	// Build Inline Keyboard UI
+	const keyboard = results.map(r => {
+		return [
+			{ text: `🔑 Get ${r.service}`, callback_data: `get:${r.service}` },
+			{ text: `❌`, callback_data: `del:${r.service}` }
+		];
+	});
+
+	const text = `🗄️ *Your Secured Services*\n_Select a service to generate a code:_`;
+	const payload = {
+		chat_id: chatId,
+		text: text,
+		parse_mode: 'MarkdownV2',
+		reply_markup: { inline_keyboard: keyboard }
+	};
+
+	if (editMessageId) {
+		await callTelegramAPI(token, 'editMessageText', { ...payload, message_id: editMessageId });
+	} else {
+		await callTelegramAPI(token, 'sendMessage', payload);
+	}
+}
 
 export default app;
