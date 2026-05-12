@@ -1,8 +1,3 @@
-// src/index.ts — Edge 2FA Bot | Production-Ready
-// Cloudflare Workers + Hono + D1 + OTPAuth
-// Security: Webhook secret validation, rate limiting, input sanitization
-// Features: TOTP, multi-service management, graceful error handling, structured logging
-
 import { Hono } from 'hono';
 import * as OTPAuth from 'otpauth';
 
